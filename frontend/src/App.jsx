@@ -1,8 +1,10 @@
+
 import { useEffect, useRef, useState } from "react";
 import {
   BookOpen, BrainCircuit, CheckCircle2, ChevronRight, Clapperboard,
   CloudUpload, FileText, Film, GraduationCap, LayoutDashboard, LoaderCircle,
-  Plus, RefreshCw, Sparkles, UploadCloud, Video, WandSparkles, X
+  Plus, RefreshCw, Sparkles, UploadCloud, Video, WandSparkles, X,
+  Clock, Mic, Palette, PlayCircle
 } from "lucide-react";
 import { api } from "./services/api";
 
@@ -16,11 +18,16 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [analyzing, setAnalyzing] = useState("");
+
   const [lesson, setLesson] = useState(null);
   const [lessonLoading, setLessonLoading] = useState("");
   const [lessonTitle, setLessonTitle] = useState("");
   const [lessonProjectId, setLessonProjectId] = useState("");
   const [lessonTopicIndex, setLessonTopicIndex] = useState(null);
+
+  const [storyboard, setStoryboard] = useState(null);
+  const [storyboardLoading, setStoryboardLoading] = useState(false);
+  const [storyboardError, setStoryboardError] = useState("");
 
   const [audioUrl, setAudioUrl] = useState("");
   const [audioLoading, setAudioLoading] = useState(false);
@@ -38,8 +45,13 @@ export default function App() {
 
   async function refresh() {
     setLoading(true);
+
     try {
-      const [items, status] = await Promise.all([api.projects(), api.health()]);
+      const [items, status] = await Promise.all([
+        api.projects(),
+        api.health()
+      ]);
+
       setProjects(items);
       setHealth(status.status === "ok" ? "connected" : "offline");
       setError("");
@@ -88,7 +100,9 @@ export default function App() {
 
     try {
       const updated = await api.analyze(id);
-      setProjects((old) => old.map((p) => p.id === id ? updated : p));
+      setProjects((old) =>
+        old.map((p) => p.id === id ? updated : p)
+      );
       setNotice("AI topic analysis completed.");
     } catch (e) {
       setError(e.message);
@@ -100,6 +114,8 @@ export default function App() {
   async function generateLesson(projectId, topicIndex, title) {
     setLessonLoading(`${projectId}-${topicIndex}`);
     setLesson(null);
+    setStoryboard(null);
+    setStoryboardError("");
     setLessonTitle(title);
     setLessonProjectId(projectId);
     setLessonTopicIndex(topicIndex);
@@ -144,8 +160,41 @@ export default function App() {
     }
   }
 
+  async function generateStoryboard() {
+    if (!lesson?.teacher_script) {
+      setStoryboardError("Please generate a lesson with teacher narration first.");
+      return;
+    }
+
+    setStoryboardLoading(true);
+    setStoryboardError("");
+    setStoryboard(null);
+    setError("");
+
+    try {
+      const result = await api.generateStoryboard(
+        lessonProjectId,
+        lessonTopicIndex,
+        lesson
+      );
+
+      if (!result.scenes || !Array.isArray(result.scenes)) {
+        throw new Error("The storyboard response does not contain a scenes list.");
+      }
+
+      setStoryboard(result);
+      setNotice("Your video storyboard was generated successfully.");
+    } catch (e) {
+      setStoryboardError(e.message);
+    } finally {
+      setStoryboardLoading(false);
+    }
+  }
+
   function closeLesson() {
     setLesson(null);
+    setStoryboard(null);
+    setStoryboardError("");
     setAudioUrl("");
     setAudioError("");
   }
@@ -158,6 +207,12 @@ export default function App() {
     (p) => p.status === "analyzed"
   ).length;
 
+  const totalScenes = projects.reduce(
+    (n, p) => n + (p.topics || []).reduce(
+      (count, topic) => count + (topic.storyboard?.scenes?.length || 0), 0
+    ), 0
+  );
+
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -167,12 +222,15 @@ export default function App() {
         </a>
 
         <div className="nav-caption">WORKSPACE</div>
+
         <a className="nav-link active" href="#dashboard">
           <LayoutDashboard />Dashboard
         </a>
+
         <a className="nav-link" href="#projects">
           <BookOpen />My projects
         </a>
+
         <a className="nav-link" href="#videos">
           <Film />Video library
         </a>
@@ -204,9 +262,11 @@ export default function App() {
             <span className={`connection ${health}`}>
               <i />API {health}
             </span>
+
             <button className="refresh" onClick={refresh} title="Refresh">
               <RefreshCw />
             </button>
+
             <span className="profile-avatar mini">E</span>
           </div>
         </header>
@@ -216,7 +276,9 @@ export default function App() {
             <div className="eyebrow">
               <Sparkles /> YOUR AI-POWERED LEARNING STUDIO
             </div>
+
             <h1>Make learning <em>come alive.</em></h1>
+
             <p>Upload a PDF and turn its topics into clear, engaging video lessons.</p>
           </div>
 
@@ -239,6 +301,7 @@ export default function App() {
         </section>
 
         {error && <div className="alert error">{error}</div>}
+
         {notice && (
           <div className="alert success">
             <CheckCircle2 />{notice}
@@ -246,10 +309,33 @@ export default function App() {
         )}
 
         <section className="stats">
-          <Stat icon={<FileText />} value={projects.length} label="PDF projects" hint="Uploaded documents" />
-          <Stat icon={<BrainCircuit />} value={analyzedCount} label="Analyzed projects" hint="Ready with detected topics" />
-          <Stat icon={<BookOpen />} value={topicCount} label="Topics detected" hint="Across all projects" />
-          <Stat icon={<Video />} value="0" label="Videos generated" hint="Rendering comes next" />
+          <Stat
+            icon={<FileText />}
+            value={projects.length}
+            label="PDF projects"
+            hint="Uploaded documents"
+          />
+
+          <Stat
+            icon={<BrainCircuit />}
+            value={analyzedCount}
+            label="Analyzed projects"
+            hint="Ready with detected topics"
+          />
+
+          <Stat
+            icon={<BookOpen />}
+            value={topicCount}
+            label="Topics detected"
+            hint="Across all projects"
+          />
+
+          <Stat
+            icon={<Video />}
+            value={totalScenes}
+            label="Storyboard scenes"
+            hint="Planned video scenes"
+          />
         </section>
 
         <section className="columns">
@@ -259,6 +345,7 @@ export default function App() {
                 <h2>Your projects</h2>
                 <p>Manage PDFs and prepare them for video lessons.</p>
               </div>
+
               <button className="link-button" onClick={refresh}>
                 Refresh <ChevronRight />
               </button>
@@ -273,6 +360,7 @@ export default function App() {
                 <span className="empty-icon"><CloudUpload /></span>
                 <h3>Your first lesson starts here</h3>
                 <p>Upload a PDF to create a project. Then run AI analysis to discover its topics.</p>
+
                 <button
                   className="primary"
                   onClick={() => fileInput.current?.click()}
@@ -288,6 +376,7 @@ export default function App() {
 
                     <div className="project-details">
                       <h3>{p.title}</h3>
+
                       <p>
                         {p.original_filename} · {p.page_count ?? "?"} pages · {dateLabel(p.created_at)}
                       </p>
@@ -296,6 +385,7 @@ export default function App() {
                         <span className={`pill ${p.status}`}>
                           {p.status.replaceAll("_", " ")}
                         </span>
+
                         {p.topics?.length > 0 && (
                           <span>{p.topics.length} topics detected</span>
                         )}
@@ -311,6 +401,7 @@ export default function App() {
                         ) : (
                           <WandSparkles />
                         )}
+
                         {p.status === "analyzed" ? "Analyzed" : "Analyze PDF"}
                       </button>
 
@@ -334,6 +425,7 @@ export default function App() {
                                 ) : (
                                   <BookOpen />
                                 )}
+
                                 {lessonLoading === `${p.id}-${index}`
                                   ? "Teaching..."
                                   : "Teach me"}
@@ -362,7 +454,7 @@ export default function App() {
               <Step n="01" title="Upload PDF" text="Add your textbook or notes." />
               <Step n="02" title="Discover topics" text="AI organizes chapters and concepts." />
               <Step n="03" title="Create lessons" text="Generate scripts, slides and voice." />
-              <Step n="04" title="Render videos" text="Publish a video for each topic." last />
+              <Step n="04" title="Build storyboards" text="Plan animated scenes for each topic." last />
             </div>
 
             <div className="tip">
@@ -382,6 +474,7 @@ export default function App() {
                 <div className="eyebrow">
                   <Sparkles /> AI TEACHER LESSON
                 </div>
+
                 <h2>{lesson.topic_title || lessonTitle}</h2>
               </div>
 
@@ -447,19 +540,19 @@ export default function App() {
                     ) : (
                       <Video />
                     )}
+
                     {audioLoading ? "Generating voice..." : "Generate teacher voice"}
                   </button>
                 </div>
 
                 {audioError && (
-                  <div className="alert error">
-                    {audioError}
-                  </div>
+                  <div className="alert error">{audioError}</div>
                 )}
 
                 {audioUrl && (
                   <div className="lesson-section">
                     <h3><Video /> AI teacher audio</h3>
+
                     <audio
                       controls
                       preload="metadata"
@@ -487,6 +580,7 @@ export default function App() {
                 {lesson.quiz.map((q, i) => (
                   <div className="quiz-item" key={i}>
                     <b>{i + 1}. {q.question}</b>
+
                     <details>
                       <summary>Reveal answer</summary>
                       <p>{q.answer}</p>
@@ -496,10 +590,125 @@ export default function App() {
               </div>
             )}
 
-            <button
-              className="primary"
-              onClick={closeLesson}
-            >
+            <div className="storyboard-generator">
+              <div className="eyebrow">
+                <Clapperboard /> VIDEO CREATION
+              </div>
+
+              <h3>Turn this lesson into a video storyboard</h3>
+
+              <p>
+                Let your AI video director divide the lesson into visual
+                scenes with narration, cartoon descriptions and animation ideas.
+              </p>
+
+              <button
+                className="primary"
+                onClick={generateStoryboard}
+                disabled={storyboardLoading || !lesson.teacher_script}
+              >
+                {storyboardLoading ? (
+                  <LoaderCircle className="spin" />
+                ) : (
+                  <WandSparkles />
+                )}
+
+                {storyboardLoading
+                  ? "Creating your storyboard..."
+                  : storyboard
+                    ? "Regenerate storyboard"
+                    : "Generate video storyboard"}
+              </button>
+
+              {storyboardError && (
+                <div className="alert error">
+                  {storyboardError}
+                </div>
+              )}
+            </div>
+
+            {storyboard && (
+              <div className="storyboard-panel" id="videos">
+                <div className="storyboard-heading">
+                  <div className="eyebrow">
+                    <Film /> YOUR VIDEO STORYBOARD
+                  </div>
+
+                  <h2>{storyboard.topic_title || lesson.topic_title}</h2>
+
+                  <p>
+                    {storyboard.scenes.length} scenes planned for your
+                    educational video.
+                  </p>
+                </div>
+
+                {storyboard.video_style && (
+                  <div className="video-style">
+                    <Palette />
+                    <div>
+                      <b>Visual style</b>
+                      <p>{storyboard.video_style}</p>
+                    </div>
+                  </div>
+                )}
+
+                <div className="scene-list">
+                  {storyboard.scenes.map((scene, index) => (
+                    <article className="scene-card" key={scene.scene_number ?? index}>
+                      <div className="scene-card-header">
+                        <span className="scene-number">
+                          SCENE {scene.scene_number ?? index + 1}
+                        </span>
+
+                        <span className="scene-duration">
+                          <Clock />
+                          {scene.duration_seconds ?? "—"} seconds
+                        </span>
+                      </div>
+
+                      <h3>{scene.scene_title || `Scene ${index + 1}`}</h3>
+
+                      <div className="scene-content">
+                        <div className="scene-detail">
+                          <span><Mic /> TEACHER NARRATION</span>
+                          <p>{scene.narration || "No narration provided."}</p>
+                        </div>
+
+                        <div className="scene-detail">
+                          <span><Palette /> VISUAL DESCRIPTION</span>
+                          <p>{scene.visual_description || "No visual description provided."}</p>
+                        </div>
+
+                        <div className="scene-detail">
+                          <span><PlayCircle /> ANIMATION</span>
+                          <p>{scene.animation || "No animation instructions provided."}</p>
+                        </div>
+                      </div>
+
+                      {scene.on_screen_text?.length > 0 && (
+                        <div className="scene-labels">
+                          <b>On-screen text</b>
+
+                          <div>
+                            {scene.on_screen_text.map((item, i) => (
+                              <span key={i}>{item}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {scene.transition && (
+                        <div className="scene-transition">
+                          <b>Transition:</b> {scene.transition}
+                        </div>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <button className="primary back-button" onClick={closeLesson}>
               <ChevronRight /> Back to projects
             </button>
           </section>
@@ -508,6 +717,7 @@ export default function App() {
         {lessonLoading && (
           <div className="lesson-loading">
             <LoaderCircle className="spin" />
+
             <div>
               <h3>Your AI teacher is preparing the lesson...</h3>
               <p>Gemini is building your explanation, examples, recap and quiz.</p>

@@ -1,3 +1,4 @@
+
 from datetime import datetime, timezone
 import asyncio
 from pathlib import Path
@@ -13,12 +14,20 @@ from app.db.mongo import get_database
 from app.services.pdf_service import extract_pdf_text
 from app.services.gemini_service import detect_topics, generate_topic_lesson
 from app.services.fish_audio_service import generate_audio
+from app.services.video_service import (
+    generate_storyboard,
+    render_storyboard_video,
+)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 
 class AudioRequest(BaseModel):
     text: str
+
+
+class StoryboardRequest(BaseModel):
+    lesson: dict
 
 
 PDF_MAGIC = b"%PDF"
@@ -252,3 +261,148 @@ async def generate_audio_for_topic(
             status_code=502,
             detail=f"Audio generation failed: {exc}"
         )
+
+
+@router.post("/{project_id}/topics/{topic_index}/storyboard")
+async def generate_storyboard_for_topic(
+    project_id: str,
+    topic_index: int,
+    request: StoryboardRequest
+):
+    if not ObjectId.is_valid(project_id):
+        raise HTTPException(status_code=400, detail="Invalid project ID.")
+
+    db = get_database()
+    doc = await db.projects.find_one({"_id": ObjectId(project_id)})
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    topics = doc.get("topics", [])
+
+    if topic_index < 0 or topic_index >= len(topics):
+        raise HTTPException(status_code=404, detail="Topic not found.")
+
+    if not request.lesson.get("teacher_script"):
+        raise HTTPException(
+            status_code=400,
+            detail="A lesson with teacher narration is required."
+        )
+
+    try:
+        storyboard = await asyncio.to_thread(
+            generate_storyboard,
+            topics[topic_index],
+            request.lesson
+        )
+
+        await db.projects.update_one(
+            {"_id": ObjectId(project_id)},
+            {
+                "$set": {
+                    f"topics.{topic_index}.storyboard": storyboard,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            }
+        )
+
+        return storyboard
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Storyboard generation failed: {exc}"
+        )
+
+
+@router.post("/{project_id}/topics/{topic_index}/video")
+async def generate_video_for_topic(project_id: str, topic_index: int):
+    if not ObjectId.is_valid(project_id):
+        raise HTTPException(status_code=400, detail="Invalid project ID.")
+
+    db = get_database()
+    project_object_id = ObjectId(project_id)
+
+    doc = await db.projects.find_one({"_id": project_object_id})
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    topics = doc.get("topics", [])
+
+    if topic_index < 0 or topic_index >= len(topics):
+        raise HTTPException(status_code=404, detail="Topic not found.")
+
+    storyboard = topics[topic_index].get("storyboard")
+
+    if not storyboard or not storyboard.get("scenes"):
+        raise HTTPException(
+            status_code=400,
+            detail="Please generate the storyboard before generating the video."
+        )
+
+    video_dir = Path(settings.upload_dir) / "videos"
+    video_dir.mkdir(parents=True, exist_ok=True)
+
+    video_path = video_dir / f"{uuid4().hex}.mp4"
+
+    try:
+        await asyncio.to_thread(
+            render_storyboard_video,
+            storyboard,
+            str(video_path),
+            generate_audio,
+        )
+
+        await db.projects.update_one(
+            {"_id": project_object_id},
+            {
+                "$set": {
+                    f"topics.{topic_index}.video_path": str(video_path),
+                    f"topics.{topic_index}.video_generated_at": datetime.now(timezone.utc),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            }
+        )
+
+        return FileResponse(
+            path=str(video_path),
+            media_type="video/mp4",
+            filename=f"eduvision_topic_{topic_index + 1}.mp4",
+        )
+
+    except Exception as exc:
+        video_path.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Video generation failed: {exc}"
+        )
+
+
+@router.get("/{project_id}/topics/{topic_index}/video")
+async def download_topic_video(project_id: str, topic_index: int):
+    if not ObjectId.is_valid(project_id):
+        raise HTTPException(status_code=400, detail="Invalid project ID.")
+
+    db = get_database()
+    doc = await db.projects.find_one({"_id": ObjectId(project_id)})
+
+    if not doc:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    topics = doc.get("topics", [])
+
+    if topic_index < 0 or topic_index >= len(topics):
+        raise HTTPException(status_code=404, detail="Topic not found.")
+
+    video_path = topics[topic_index].get("video_path")
+
+    if not video_path or not Path(video_path).is_file():
+        raise HTTPException(status_code=404, detail="Video has not been generated yet.")
+
+    return FileResponse(
+        path=video_path,
+        media_type="video/mp4",
+        filename=f"eduvision_topic_{topic_index + 1}.mp4",
+    )
