@@ -12,6 +12,17 @@ async function request(path, options = {}) {
   return data;
 }
 
+async function requestBlob(path, options = {}) {
+  const response = await fetch(`${API_BASE}/api${path}`, options);
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.detail || `Request failed (${response.status})`);
+  }
+
+  return response.blob();
+}
+
 export const api = {
   health: () => request("/health"),
 
@@ -23,46 +34,43 @@ export const api = {
 
     return request("/projects/upload", {
       method: "POST",
-      body
+      body,
     });
   },
 
   analyze: (id) =>
     request(`/projects/${id}/analyze`, {
-      method: "POST"
+      method: "POST",
     }),
 
   generateLesson: (id, topicIndex) =>
     request(`/projects/${id}/topics/${topicIndex}/lesson`, {
-      method: "POST"
+      method: "POST",
     }),
 
   generateStoryboard: (id, topicIndex, lesson) =>
     request(`/projects/${id}/topics/${topicIndex}/storyboard`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify({ lesson })
+      body: JSON.stringify({ lesson }),
     }),
 
-  generateAudio: async (id, topicIndex, text) => {
-    const response = await fetch(
-      `${API_BASE}/api/projects/${id}/topics/${topicIndex}/audio`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ text })
-      }
-    );
+  generateAudio: (id, topicIndex, text) =>
+    requestBlob(`/projects/${id}/topics/${topicIndex}/audio`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ text }),
+    }),
 
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
-      throw new Error(data.detail || "Audio generation failed");
-    }
+  generateVideo: (id, topicIndex) =>
+    requestBlob(`/projects/${id}/topics/${topicIndex}/video`, {
+      method: "POST",
+    }),
 
-    return response.blob();
-  }
+  getVideo: (id, topicIndex) =>
+    requestBlob(`/projects/${id}/topics/${topicIndex}/video`),
 };

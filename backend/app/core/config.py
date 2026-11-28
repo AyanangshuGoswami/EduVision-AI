@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     upload_dir: str = "uploads"
     max_upload_mb: int = 20
     gemini_api_key: str | None = None
-    gemini_model: str = "gemini-3.5-flash"
+    gemini_model: str = "gemini-3.8-flash"
     max_analysis_chars: int = 50_000
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")

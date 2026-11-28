@@ -1,4 +1,3 @@
-
 import json
 import re
 import time
@@ -7,17 +6,35 @@ from google import genai
 from app.core.config import settings
 
 
-def _generate_with_retry(client, prompt: str):
-    """Retry Gemini requests when temporary service errors occur."""
 
-    max_attempts = 4
+def _generate_with_retry(client, prompt: str, config=None):
+    """Retry temporary Gemini errors without making users wait too long.
+
+    The optional config argument lets specific tasks, such as storyboard
+    generation, request JSON output without changing existing callers.
+    """
+
+    max_attempts = 2
 
     for attempt in range(max_attempts):
         try:
-            return client.models.generate_content(
-                model=settings.gemini_model,
-                contents=prompt,
+            print(
+                f"Sending request to Gemini "
+                f"using {settings.gemini_model}..."
             )
+
+            request_options = {
+                "model": settings.gemini_model,
+                "contents": prompt,
+            }
+
+            if config is not None:
+                request_options["config"] = config
+
+            response = client.models.generate_content(**request_options)
+
+            print("Gemini response received successfully.")
+            return response
 
         except Exception as exc:
             error_text = str(exc).upper()
@@ -38,27 +55,60 @@ def _generate_with_retry(client, prompt: str):
             )
 
             if not temporary_error or attempt == max_attempts - 1:
+                print(f"Gemini request failed: {exc}")
                 raise
 
-            wait_seconds = 2 ** (attempt + 1)
             print(
-                f"Gemini temporarily unavailable. "
-                f"Retrying in {wait_seconds} seconds "
-                f"({attempt + 1}/{max_attempts - 1})..."
+                "Gemini is temporarily unavailable. "
+                "Retrying once in 5 seconds..."
             )
-            time.sleep(wait_seconds)
+
+            time.sleep(5)
+
+
 
 
 def _clean_json_response(text: str):
-    cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    """Parse a Gemini JSON response, tolerating surrounding code fences/text."""
+
+    if not text or not text.strip():
+        raise ValueError("Gemini returned an empty JSON response.")
+
+    cleaned = text.strip()
+
+    # Remove Markdown code fences if Gemini includes them.
+    cleaned = re.sub(
+        r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE
+    )
     cleaned = re.sub(r"\s*```$", "", cleaned)
-    return json.loads(cleaned)
+
+    # Extract the JSON object if explanatory text surrounds it.
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(
+            "Gemini did not return a complete JSON object. "
+            f"Response preview: {cleaned[:500]}"
+        )
+
+    cleaned = cleaned[start:end + 1]
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "Gemini returned invalid JSON. "
+            f"Error at line {exc.lineno}, column {exc.colno}. "
+            f"Response preview: {cleaned[:500]}"
+        ) from exc
 
 
 def detect_topics(document_text: str) -> dict:
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured in backend/.env")
-
+    print("Gemini model:", settings.gemini_model)
+    print("Gemini API key configured:", bool(settings.gemini_api_key))
     client = genai.Client(api_key=settings.gemini_api_key)
 
     prompt = f'''

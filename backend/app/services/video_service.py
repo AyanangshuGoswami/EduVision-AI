@@ -305,7 +305,11 @@ Return valid JSON only.
 Do not use Markdown fences.
 """
 
-    response = _generate_with_retry(client, prompt)
+    response = _generate_with_retry(
+        client,
+        prompt,
+        config={"response_mime_type": "application/json"},
+    )
 
     if not response.text:
         raise RuntimeError(

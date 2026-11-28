@@ -4,7 +4,7 @@ import {
   BookOpen, BrainCircuit, CheckCircle2, ChevronRight, Clapperboard,
   CloudUpload, FileText, Film, GraduationCap, LayoutDashboard, LoaderCircle,
   Plus, RefreshCw, Sparkles, UploadCloud, Video, WandSparkles, X,
-  Clock, Mic, Palette, PlayCircle
+  Clock, Mic, Palette, PlayCircle, Download
 } from "lucide-react";
 import { api } from "./services/api";
 
@@ -33,15 +33,27 @@ export default function App() {
   const [audioLoading, setAudioLoading] = useState(false);
   const [audioError, setAudioError] = useState("");
 
+  const [videoUrl, setVideoUrl] = useState("");
+  const [videoLoading, setVideoLoading] = useState(false);
+  const [videoError, setVideoError] = useState("");
+
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const fileInput = useRef(null);
 
+  // Clean up temporary audio URLs.
   useEffect(() => {
     return () => {
       if (audioUrl) URL.revokeObjectURL(audioUrl);
     };
   }, [audioUrl]);
+
+  // Clean up temporary video URLs.
+  useEffect(() => {
+    return () => {
+      if (videoUrl) URL.revokeObjectURL(videoUrl);
+    };
+  }, [videoUrl]);
 
   async function refresh() {
     setLoading(true);
@@ -119,8 +131,13 @@ export default function App() {
     setLessonTitle(title);
     setLessonProjectId(projectId);
     setLessonTopicIndex(topicIndex);
+
     setAudioUrl("");
     setAudioError("");
+
+    setVideoUrl("");
+    setVideoError("");
+
     setError("");
     setNotice("");
 
@@ -169,6 +186,10 @@ export default function App() {
     setStoryboardLoading(true);
     setStoryboardError("");
     setStoryboard(null);
+
+    setVideoUrl("");
+    setVideoError("");
+
     setError("");
 
     try {
@@ -191,12 +212,54 @@ export default function App() {
     }
   }
 
+  // Generate the final MP4 video from the saved storyboard.
+  async function generateVideo() {
+    if (!storyboard?.scenes?.length) {
+      setVideoError("Please generate a storyboard first.");
+      return;
+    }
+
+    setVideoLoading(true);
+    setVideoError("");
+    setVideoUrl("");
+    setError("");
+    setNotice("");
+
+    try {
+      const videoBlob = await api.generateVideo(
+        lessonProjectId,
+        lessonTopicIndex
+      );
+
+      if (!videoBlob || videoBlob.size === 0) {
+        throw new Error("The generated video file is empty.");
+      }
+
+      if (!videoBlob.type.startsWith("video/") &&
+          videoBlob.type !== "application/octet-stream") {
+        throw new Error("The server did not return a valid video file.");
+      }
+
+      const newVideoUrl = URL.createObjectURL(videoBlob);
+      setVideoUrl(newVideoUrl);
+      setNotice("Your educational video was generated successfully.");
+    } catch (e) {
+      setVideoError(e.message);
+    } finally {
+      setVideoLoading(false);
+    }
+  }
+
   function closeLesson() {
     setLesson(null);
     setStoryboard(null);
     setStoryboardError("");
+
     setAudioUrl("");
     setAudioError("");
+
+    setVideoUrl("");
+    setVideoError("");
   }
 
   const topicCount = projects.reduce(
@@ -651,6 +714,89 @@ export default function App() {
                     </div>
                   </div>
                 )}
+
+                {/* Final video generation and playback */}
+                <div className="video-generator">
+                  <h3>Bring your storyboard to life</h3>
+
+                  <p>
+                    Generate your animated educational video with AI teacher narration.
+                    This may take a few minutes.
+                  </p>
+
+                  <button
+                    className="primary"
+                    onClick={generateVideo}
+                    disabled={videoLoading}
+                  >
+                    {videoLoading ? (
+                      <LoaderCircle className="spin" />
+                    ) : (
+                      <Video />
+                    )}
+
+                    {videoLoading
+                      ? "Generating your video..."
+                      : videoUrl
+                        ? "Generate video again"
+                        : "Generate final video"}
+                  </button>
+
+                  {videoLoading && (
+                    <div className="empty">
+                      <LoaderCircle className="spin" />
+                      <p>
+                        Your AI video director is rendering the scenes and
+                        generating the teacher narration. Please keep this page open.
+                      </p>
+                    </div>
+                  )}
+
+                  {videoError && (
+                    <div className="alert error">
+                      {videoError}
+                    </div>
+                  )}
+
+                  {videoUrl && (
+                    <div className="generated-video">
+                      <h3>Your educational video is ready!</h3>
+
+                      <video
+                        controls
+                        playsInline
+                        preload="metadata"
+                        src={videoUrl}
+                        style={{
+                          width: "100%",
+                          maxWidth: "900px",
+                          borderRadius: "12px",
+                          background: "#000",
+                          marginTop: "12px"
+                        }}
+                      >
+                        Your browser does not support video playback.
+                      </video>
+
+                      <div style={{ marginTop: "16px" }}>
+                        <a
+                          className="secondary"
+                          href={videoUrl}
+                          download={`eduvision-${lessonTitle.replace(/[^a-z0-9]/gi, "-")}.mp4`}
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "8px",
+                            textDecoration: "none"
+                          }}
+                        >
+                          <Download size={18} />
+                          Download MP4 video
+                        </a>
+                      </div>
+                    </div>
+                  )}
+                </div>
 
                 <div className="scene-list">
                   {storyboard.scenes.map((scene, index) => (
