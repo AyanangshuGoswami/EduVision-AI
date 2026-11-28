@@ -4,7 +4,7 @@ import {
   BookOpen, BrainCircuit, CheckCircle2, ChevronRight, Clapperboard,
   CloudUpload, FileText, Film, GraduationCap, LayoutDashboard, LoaderCircle,
   Plus, RefreshCw, Sparkles, UploadCloud, Video, WandSparkles, X,
-  Clock, Mic, Palette, PlayCircle, Download
+  Clock, Mic, Palette, PlayCircle, Download, Trash2
 } from "lucide-react";
 import { api } from "./services/api";
 
@@ -18,6 +18,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [analyzing, setAnalyzing] = useState("");
+  const [deleting, setDeleting] = useState("");
 
   const [lesson, setLesson] = useState(null);
   const [lessonLoading, setLessonLoading] = useState("");
@@ -120,6 +121,34 @@ export default function App() {
       setError(e.message);
     } finally {
       setAnalyzing("");
+    }
+  }
+
+  async function deleteProject(id, title) {
+    const confirmed = window.confirm(
+      `Are you sure you want to delete "${title}"? This will permanently delete the PDF and its generated videos.`
+    );
+
+    if (!confirmed) return;
+
+    setDeleting(id);
+    setError("");
+    setNotice("");
+
+    try {
+      await api.deleteProject(id);
+
+      setProjects((old) => old.filter((p) => p.id !== id));
+
+      if (lessonProjectId === id) {
+        closeLesson();
+      }
+
+      setNotice(`"${title}" was deleted successfully.`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setDeleting("");
     }
   }
 
@@ -454,19 +483,35 @@ export default function App() {
                         )}
                       </div>
 
-                      <button
-                        className="secondary"
-                        disabled={analyzing === p.id || p.status === "analyzed"}
-                        onClick={() => analyze(p.id)}
-                      >
-                        {analyzing === p.id ? (
-                          <LoaderCircle className="spin" />
-                        ) : (
-                          <WandSparkles />
-                        )}
+                      <div className="project-actions">
+                        <button
+                          className="secondary"
+                          disabled={analyzing === p.id || deleting === p.id || p.status === "analyzed"}
+                          onClick={() => analyze(p.id)}
+                        >
+                          {analyzing === p.id ? (
+                            <LoaderCircle className="spin" />
+                          ) : (
+                            <WandSparkles />
+                          )}
 
-                        {p.status === "analyzed" ? "Analyzed" : "Analyze PDF"}
-                      </button>
+                          {p.status === "analyzed" ? "Analyzed" : "Analyze PDF"}
+                        </button>
+
+                        <button
+                          className="secondary delete-button"
+                          disabled={deleting === p.id || analyzing === p.id}
+                          onClick={() => deleteProject(p.id, p.title)}
+                        >
+                          {deleting === p.id ? (
+                            <LoaderCircle className="spin" />
+                          ) : (
+                            <Trash2 />
+                          )}
+
+                          {deleting === p.id ? "Deleting..." : "Delete PDF"}
+                        </button>
+                      </div>
 
                       {p.topics?.length > 0 && (
                         <div className="topic-list">
@@ -480,7 +525,7 @@ export default function App() {
 
                               <button
                                 className="secondary"
-                                disabled={lessonLoading === `${p.id}-${index}`}
+                                disabled={lessonLoading === `${p.id}-${index}` || deleting === p.id}
                                 onClick={() => generateLesson(p.id, index, topic.title)}
                               >
                                 {lessonLoading === `${p.id}-${index}` ? (
@@ -715,7 +760,6 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Final video generation and playback */}
                 <div className="video-generator">
                   <h3>Bring your storyboard to life</h3>
 

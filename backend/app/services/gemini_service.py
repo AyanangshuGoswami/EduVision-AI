@@ -1,18 +1,22 @@
+
 import json
 import re
 import time
+from collections import OrderedDict
 
 from google import genai
+from google.genai import types
+
 from app.core.config import settings
 
 
+# Maximum text sent to Gemini in one analysis request.
+# The complete PDF is analyzed across multiple chunks.
+ANALYSIS_CHUNK_CHARS = 25000
 
-def _generate_with_retry(client, prompt: str, config=None):
-    """Retry temporary Gemini errors without making users wait too long.
 
-    The optional config argument lets specific tasks, such as storyboard
-    generation, request JSON output without changing existing callers.
-    """
+def _generate_with_retry(client, prompt, config=None):
+    """Retry temporary Gemini errors without changing existing callers."""
 
     max_attempts = 2
 
@@ -66,23 +70,23 @@ def _generate_with_retry(client, prompt: str, config=None):
             time.sleep(5)
 
 
-
-
 def _clean_json_response(text: str):
-    """Parse a Gemini JSON response, tolerating surrounding code fences/text."""
+    """Parse a Gemini JSON response, tolerating surrounding code fences."""
 
     if not text or not text.strip():
         raise ValueError("Gemini returned an empty JSON response.")
 
     cleaned = text.strip()
 
-    # Remove Markdown code fences if Gemini includes them.
     cleaned = re.sub(
-        r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE
+        r"^```(?:json)?\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
     )
+
     cleaned = re.sub(r"\s*```$", "", cleaned)
 
-    # Extract the JSON object if explanatory text surrounds it.
     start = cleaned.find("{")
     end = cleaned.rfind("}")
 
@@ -95,7 +99,13 @@ def _clean_json_response(text: str):
     cleaned = cleaned[start:end + 1]
 
     try:
-        return json.loads(cleaned)
+        result = json.loads(cleaned)
+
+        if not isinstance(result, dict):
+            raise ValueError("Gemini response must be a JSON object.")
+
+        return result
+
     except json.JSONDecodeError as exc:
         raise ValueError(
             "Gemini returned invalid JSON. "
@@ -104,45 +114,538 @@ def _clean_json_response(text: str):
         ) from exc
 
 
-def detect_topics(document_text: str) -> dict:
-    if not settings.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured in backend/.env")
-    print("Gemini model:", settings.gemini_model)
-    print("Gemini API key configured:", bool(settings.gemini_api_key))
-    client = genai.Client(api_key=settings.gemini_api_key)
+def _split_document_into_chunks(
+    document_text: str,
+    max_chars: int = ANALYSIS_CHUNK_CHARS,
+) -> list[str]:
+    """
+    Split PDF text into manageable chunks.
 
-    prompt = f'''
-You are an instructional designer. Analyze this PDF text and identify teaching
-topics in order. Do not invent unsupported topics. Return ONLY valid JSON:
+    Prefer page boundaries so that page references remain meaningful.
+    Very large individual pages are split into smaller sections.
+    """
+
+    page_pattern = re.compile(
+        r"(?m)^\[PAGE\s+(\d+)\]\s*$"
+    )
+
+    matches = list(page_pattern.finditer(document_text))
+
+    # Fallback for text without page markers.
+    if not matches:
+        return [
+            document_text[index:index + max_chars]
+            for index in range(0, len(document_text), max_chars)
+        ]
+
+    pages = []
+
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(document_text)
+        )
+
+        page_number = match.group(1)
+        page_content = document_text[match.end():end].strip()
+
+        pages.append(
+            f"[PAGE {page_number}]\n{page_content}"
+        )
+
+    chunks = []
+    current_chunk = ""
+
+    for page in pages:
+        # Split an unusually large page into smaller pieces.
+        if len(page) > max_chars:
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+                current_chunk = ""
+
+            page_header_match = re.match(
+                r"^\[PAGE\s+(\d+)\]\s*",
+                page,
+            )
+
+            if page_header_match:
+                page_number = page_header_match.group(1)
+                page_content = page[page_header_match.end():]
+
+                content_limit = max(
+                    1,
+                    max_chars - len(f"[PAGE {page_number}]\n"),
+                )
+
+                for start in range(0, len(page_content), content_limit):
+                    section = page_content[start:start + content_limit]
+
+                    chunks.append(
+                        f"[PAGE {page_number}]\n{section}"
+                    )
+            else:
+                for start in range(0, len(page), max_chars):
+                    chunks.append(page[start:start + max_chars])
+
+            continue
+
+        proposed_chunk = (
+            f"{current_chunk}\n\n{page}"
+            if current_chunk
+            else page
+        )
+
+        if len(proposed_chunk) > max_chars:
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+
+            current_chunk = page
+        else:
+            current_chunk = proposed_chunk
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+def _analyze_document_chunk(
+    client,
+    chunk_text: str,
+    chunk_number: int,
+    total_chunks: int,
+) -> dict:
+    """Analyze one section of the PDF."""
+
+    prompt = f"""
+You are an expert educational instructional designer and document analyst.
+
+You are analyzing section {chunk_number} of {total_chunks}
+of a larger educational PDF.
+
+Your task is to identify the actual educational content in this section.
+
+Be comprehensive. Do not identify only the biggest chapter headings.
+Find the meaningful topics, smaller topics, concepts, methods,
+processes, and important ideas that a student should learn.
+
+IMPORTANT RULES:
+
+1. Use only information supported by the supplied PDF section.
+2. Do not invent topics, formulas, examples, or claims.
+3. Preserve the order in which topics appear in the document.
+4. Identify smaller subtopics rather than grouping everything
+   into a few overly broad topics.
+5. Use clear, beginner-friendly topic titles.
+6. Write useful descriptions explaining what each topic teaches.
+7. Include the actual page numbers shown in the supplied text.
+8. If a topic continues across several pages, include all relevant
+   page numbers that are visible in this section.
+9. Do not confuse an example with a separate major topic.
+10. Do not omit important technical concepts simply because
+    they are difficult.
+
+Return ONLY valid JSON in this structure:
+
 {{
-  "document_title": "short title",
-  "summary": "2-4 sentence summary",
+  "document_title": "document title if identifiable",
+  "summary": "summary of this section",
   "topics": [
     {{
-      "title": "topic title",
-      "description": "brief description",
+      "title": "specific topic title",
+      "description": "clear explanation of what this topic covers",
       "source_pages": [1, 2],
-      "subtopics": ["subtopic one", "subtopic two"]
+      "subtopics": [
+        "specific subtopic one",
+        "specific subtopic two"
+      ]
     }}
   ]
 }}
-Use only page numbers explicitly shown in the supplied text.
 
-PDF TEXT:
-{document_text}
-'''
+If no meaningful topics are present in this section,
+return an empty topics array.
+
+PDF SECTION:
+
+{chunk_text}
+"""
 
     response = _generate_with_retry(client, prompt)
 
     if not response.text:
-        raise RuntimeError("Gemini returned an empty response")
+        raise RuntimeError(
+            f"Gemini returned an empty response for section {chunk_number}."
+        )
 
     return _clean_json_response(response.text)
 
 
-def generate_topic_lesson(topic: dict, document_summary: str = "") -> dict:
+def _normalize_title(title: str) -> str:
+    """Create a comparable version of a topic title."""
+
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        str(title).lower(),
+    ).strip()
+
+
+def _merge_chunk_analyses(analyses: list[dict]) -> dict:
+    """
+    Merge chunk results without discarding topics.
+
+    Topics with exactly matching normalized titles are combined.
+    Page numbers and subtopics are preserved.
+    """
+
+    merged_topics = OrderedDict()
+
+    document_title = ""
+    summaries = []
+
+    for analysis in analyses:
+        if not document_title:
+            document_title = str(
+                analysis.get("document_title", "")
+            ).strip()
+
+        summary = str(analysis.get("summary", "")).strip()
+
+        if summary:
+            summaries.append(summary)
+
+        topics = analysis.get("topics", [])
+
+        if not isinstance(topics, list):
+            continue
+
+        for topic in topics:
+            if not isinstance(topic, dict):
+                continue
+
+            title = str(topic.get("title", "")).strip()
+
+            if not title:
+                continue
+
+            normalized_title = _normalize_title(title)
+
+            if not normalized_title:
+                continue
+
+            description = str(
+                topic.get("description", "")
+            ).strip()
+
+            source_pages = topic.get("source_pages", [])
+            subtopics = topic.get("subtopics", [])
+
+            if not isinstance(source_pages, list):
+                source_pages = []
+
+            if not isinstance(subtopics, list):
+                subtopics = []
+
+            if normalized_title not in merged_topics:
+                merged_topics[normalized_title] = {
+                    "title": title,
+                    "description": description,
+                    "source_pages": [],
+                    "subtopics": [],
+                }
+
+            existing = merged_topics[normalized_title]
+
+            # Preserve useful descriptions from different chunks.
+            if description and description not in existing["description"]:
+                if not existing["description"]:
+                    existing["description"] = description
+                else:
+                    existing["description"] += " " + description
+
+            # Merge page numbers without duplicates.
+            for page in source_pages:
+                try:
+                    page_number = int(page)
+
+                    if page_number not in existing["source_pages"]:
+                        existing["source_pages"].append(page_number)
+
+                except (TypeError, ValueError):
+                    continue
+
+            # Merge subtopics without duplicates.
+            existing_subtopics = {
+                _normalize_title(item)
+                for item in existing["subtopics"]
+            }
+
+            for subtopic in subtopics:
+                if not isinstance(subtopic, str):
+                    continue
+
+                subtopic = subtopic.strip()
+                normalized_subtopic = _normalize_title(subtopic)
+
+                if (
+                    subtopic
+                    and normalized_subtopic
+                    and normalized_subtopic not in existing_subtopics
+                ):
+                    existing["subtopics"].append(subtopic)
+                    existing_subtopics.add(normalized_subtopic)
+
+    final_topics = list(merged_topics.values())
+
+    for topic in final_topics:
+        topic["source_pages"].sort()
+
+    # Keep the summaries from all sections.
+    combined_summary = " ".join(summaries)
+
+    return {
+        "document_title": document_title or "Untitled Document",
+        "summary": combined_summary,
+        "topics": final_topics,
+    }
+
+
+def detect_topics(document_text: str) -> dict:
+    """
+    Analyze the complete PDF using multiple Gemini requests.
+
+    The input is split into page-based chunks. Each chunk is analyzed
+    separately, and the resulting topics are merged.
+    """
+
     if not settings.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured in backend/.env")
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured in backend/.env"
+        )
+
+    if not document_text or not document_text.strip():
+        raise ValueError("The PDF does not contain extractable text.")
+
+    print("Gemini model:", settings.gemini_model)
+    print("Gemini API key configured:", bool(settings.gemini_api_key))
+
+    chunks = _split_document_into_chunks(document_text)
+
+    if not chunks:
+        raise ValueError("Could not divide the PDF into analysis sections.")
+
+    print(f"PDF analysis started: {len(chunks)} section(s).")
+
+    client = genai.Client(api_key=settings.gemini_api_key)
+
+    analyses = []
+
+    for index, chunk in enumerate(chunks, start=1):
+        print(
+            f"Analyzing PDF section {index}/{len(chunks)} "
+            f"({len(chunk)} characters)..."
+        )
+
+        analysis = _analyze_document_chunk(
+            client,
+            chunk,
+            index,
+            len(chunks),
+        )
+
+        analyses.append(analysis)
+
+        print(
+            f"Section {index}/{len(chunks)} completed. "
+            f"Topics found: {len(analysis.get('topics', []))}"
+        )
+
+        if index < len(chunks):
+            time.sleep(1)
+
+    final_analysis = _merge_chunk_analyses(analyses)
+
+    print(
+        "PDF analysis completed. "
+        f"Total merged topics: {len(final_analysis['topics'])}"
+    )
+
+    return final_analysis
+
+
+def detect_topics_from_pages(pages: list[dict]) -> dict:
+    """
+    Analyze PDF pages using both extracted text and rendered images.
+
+    Processes four pages per Gemini request.
+    """
+
+    if not settings.gemini_api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured in backend/.env"
+        )
+
+    if not pages:
+        raise ValueError("No PDF pages were supplied for analysis.")
+
+    client = genai.Client(api_key=settings.gemini_api_key)
+
+    pages_per_group = 4
+    analyses = []
+
+    total_groups = (
+        len(pages) + pages_per_group - 1
+    ) // pages_per_group
+
+    print(
+        f"Starting visual PDF analysis: "
+        f"{len(pages)} pages in {total_groups} groups."
+    )
+
+    for group_index in range(total_groups):
+        group = pages[
+            group_index * pages_per_group:
+            (group_index + 1) * pages_per_group
+        ]
+
+        # IMPORTANT:
+        # Prepare this text BEFORE creating the f-string.
+        # This avoids the Python 3.11 f-string backslash SyntaxError.
+        extracted_pages_text = "\n".join(
+            [
+                "[PAGE " + str(page["page_number"]) + "]\n"
+                + page.get("text", "")
+                for page in group
+            ]
+        )
+
+        prompt = f"""
+You are an expert educational document analyst.
+
+Analyze ALL supplied PDF slides carefully, using BOTH:
+1. The extracted selectable text.
+2. The actual rendered slide images.
+
+Your goal is to identify EVERY meaningful educational topic
+and subtopic. Do not reduce a detailed lecture into a few
+broad chapter headings.
+
+IMPORTANT INSTRUCTIONS:
+
+- Inspect every supplied page image.
+- Read headings, subheadings, diagram labels, formulas,
+  captions, examples and visible text.
+- Do not ignore information merely because it appears
+  inside a diagram or image.
+- Identify distinct concepts as separate teachable topics.
+- Preserve the original order of the PDF.
+- Do not combine different concepts into one broad topic.
+- A major concept can be a topic even if it occupies only
+  one slide.
+- Include meaningful methods, architectures, advantages,
+  limitations, problems, experiments and solutions.
+- Keep related details as subtopics when appropriate.
+- Do not invent information.
+- Include the exact PDF page numbers.
+- Avoid duplicate topics within this group.
+
+For every topic, provide:
+- A specific and informative title.
+- A useful description of what the student will learn.
+- All relevant PDF page numbers.
+- Its important subtopics.
+
+Do not create a separate topic for every individual sentence.
+However, do not merge genuinely different technical concepts.
+
+Return ONLY valid JSON:
+
+{{
+  "document_title": "document title",
+  "summary": "detailed summary of these pages",
+  "topics": [
+    {{
+      "title": "specific educational topic",
+      "description": "what the student will learn",
+      "source_pages": [1, 2],
+      "subtopics": [
+        "specific concept",
+        "another specific concept"
+      ]
+    }}
+  ]
+}}
+
+EXTRACTED TEXT FROM THESE PAGES:
+
+{extracted_pages_text}
+"""
+
+        # Gemini receives the text prompt followed by each page's
+        # page-number label and corresponding rendered image.
+        contents = [prompt]
+
+        for page in group:
+            page_number = page.get("page_number", "Unknown")
+
+            contents.append(
+                f"Rendered image of PDF page {page_number} follows."
+            )
+
+            image_data = page.get("image")
+
+            if image_data:
+                contents.append(
+                    types.Part.from_bytes(
+                        data=image_data,
+                        mime_type="image/png",
+                    )
+                )
+
+        print(
+            f"Analyzing visual group "
+            f"{group_index + 1}/{total_groups}..."
+        )
+
+        response = _generate_with_retry(client, contents)
+
+        if not response.text:
+            raise RuntimeError(
+                f"Gemini returned an empty response "
+                f"for group {group_index + 1}."
+            )
+
+        analysis = _clean_json_response(response.text)
+        analyses.append(analysis)
+
+        print(
+            f"Group {group_index + 1} completed. "
+            f"Topics found: {len(analysis.get('topics', []))}"
+        )
+
+        if group_index < total_groups - 1:
+            time.sleep(1)
+
+    final_analysis = _merge_chunk_analyses(analyses)
+
+    print(
+        "Visual PDF analysis completed. "
+        f"Topics found: {len(final_analysis['topics'])}"
+    )
+
+    return final_analysis
+
+
+def generate_topic_lesson(topic: dict, document_summary: str = "") -> dict:
+    """Generate a detailed, beginner-friendly English lesson."""
+
+    if not settings.gemini_api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not configured in backend/.env"
+        )
 
     client = genai.Client(api_key=settings.gemini_api_key)
 
@@ -419,7 +922,6 @@ It must not be a shortened copy of the introduction or explanation.
 
 Every field must be educationally useful.
 """
-
 
     response = _generate_with_retry(client, prompt)
 

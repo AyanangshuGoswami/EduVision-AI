@@ -38,6 +38,11 @@ export const api = {
     });
   },
 
+  deleteProject: (id) =>
+    request(`/projects/${id}`, {
+      method: "DELETE",
+    }),
+
   analyze: (id) =>
     request(`/projects/${id}/analyze`, {
       method: "POST",

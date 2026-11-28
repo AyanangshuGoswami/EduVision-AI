@@ -11,8 +11,12 @@ from pydantic import BaseModel
 
 from app.core.config import settings
 from app.db.mongo import get_database
-from app.services.pdf_service import extract_pdf_text
-from app.services.gemini_service import detect_topics, generate_topic_lesson
+from app.services.pdf_service import extract_pdf_text, extract_pdf_pages
+from app.services.gemini_service import (
+    detect_topics,
+    detect_topics_from_pages,
+    generate_topic_lesson,
+)
 from app.services.fish_audio_service import generate_audio
 from app.services.video_service import (
     generate_storyboard,
@@ -33,6 +37,23 @@ class StoryboardRequest(BaseModel):
 PDF_MAGIC = b"%PDF"
 
 
+def remove_project_file(file_path: str, upload_root: Path) -> None:
+    """
+    Delete a project file only if it is inside the upload directory.
+    Missing files are ignored.
+    """
+
+    target = Path(file_path).resolve()
+    safe_root = upload_root.resolve()
+
+    if not target.is_relative_to(safe_root):
+        print(f"Skipped file outside upload directory: {target}")
+        return
+
+    if target.is_file():
+        target.unlink()
+
+
 def serialize_project(doc: dict) -> dict:
     return {
         "id": str(doc["_id"]),
@@ -49,12 +70,18 @@ def serialize_project(doc: dict) -> dict:
 @router.post("/upload", status_code=status.HTTP_201_CREATED)
 async def upload_pdf(file: UploadFile = File(...)):
     if file.content_type != "application/pdf":
-        raise HTTPException(status_code=415, detail="Please upload a PDF file.")
+        raise HTTPException(
+            status_code=415,
+            detail="Please upload a PDF file."
+        )
 
     contents = await file.read()
 
     if not contents:
-        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        raise HTTPException(
+            status_code=400,
+            detail="The uploaded file is empty."
+        )
 
     if len(contents) > settings.max_upload_mb * 1024 * 1024:
         raise HTTPException(
@@ -76,9 +103,14 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     try:
         page_count, _ = extract_pdf_text(stored_path)
+
     except Exception:
         stored_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail="Could not read this PDF.")
+
+        raise HTTPException(
+            status_code=400,
+            detail="Could not read this PDF."
+        )
 
     now = datetime.now(timezone.utc)
 
@@ -101,64 +133,189 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 @router.get("")
 async def list_projects():
-    cursor = get_database().projects.find({}).sort("created_at", -1).limit(50)
-    return [serialize_project(doc) async for doc in cursor]
+    cursor = (
+        get_database()
+        .projects
+        .find({})
+        .sort("created_at", -1)
+        .limit(50)
+    )
+
+    return [
+        serialize_project(doc)
+        async for doc in cursor
+    ]
 
 
 @router.get("/{project_id}")
 async def get_project(project_id: str):
     if not ObjectId.is_valid(project_id):
-        raise HTTPException(status_code=400, detail="Invalid project ID.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project ID."
+        )
 
     doc = await get_database().projects.find_one(
         {"_id": ObjectId(project_id)}
     )
 
     if not doc:
-        raise HTTPException(status_code=404, detail="Project not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found."
+        )
 
     return serialize_project(doc)
+
+
+@router.delete("/{project_id}")
+async def delete_project(project_id: str):
+    if not ObjectId.is_valid(project_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project ID."
+        )
+
+    db = get_database()
+    project_object_id = ObjectId(project_id)
+
+    doc = await db.projects.find_one(
+        {"_id": project_object_id}
+    )
+
+    if not doc:
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found."
+        )
+
+    upload_root = Path(settings.upload_dir)
+
+    files_to_delete = []
+
+    # Original uploaded PDF
+    stored_path = doc.get("stored_path")
+    if stored_path:
+        files_to_delete.append(stored_path)
+
+    # Videos generated for this project's topics
+    for topic in doc.get("topics", []):
+        video_path = topic.get("video_path")
+        if video_path:
+            files_to_delete.append(video_path)
+
+    # Delete associated files safely
+    try:
+        for file_path in set(files_to_delete):
+            remove_project_file(file_path, upload_root)
+
+    except OSError as exc:
+        print(f"Project file deletion failed: {exc}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not delete all project files. Please try again."
+        )
+
+    # Delete the project record from MongoDB
+    await db.projects.delete_one(
+        {"_id": project_object_id}
+    )
+
+    return {
+        "message": "Project and its stored PDF/video files deleted successfully.",
+        "id": project_id
+    }
 
 
 @router.post("/{project_id}/analyze")
 async def analyze_project(project_id: str):
     if not ObjectId.is_valid(project_id):
-        raise HTTPException(status_code=400, detail="Invalid project ID.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project ID."
+        )
 
     db = get_database()
-    doc = await db.projects.find_one({"_id": ObjectId(project_id)})
+
+    doc = await db.projects.find_one(
+        {"_id": ObjectId(project_id)}
+    )
 
     if not doc:
-        raise HTTPException(status_code=404, detail="Project not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found."
+        )
 
     try:
-        page_count, extracted_text = extract_pdf_text(doc["stored_path"])
+        # Extract selectable text and rendered images
+        # from every page of the PDF.
+        page_count, pages = extract_pdf_pages(
+            doc["stored_path"]
+        )
 
-        if not extracted_text.strip():
+        if not pages:
             raise HTTPException(
                 status_code=422,
-                detail="No selectable text found. OCR for scanned PDFs is not enabled yet.",
+                detail="Could not extract pages from this PDF."
             )
 
-        analysis = await asyncio.to_thread(
-            detect_topics,
-            extracted_text[:settings.max_analysis_chars]
+        total_text_characters = sum(
+            len(page.get("text", ""))
+            for page in pages
         )
+
+        print(
+            f"Starting visual PDF analysis: "
+            f"{page_count} pages, "
+            f"{total_text_characters} extracted text characters."
+        )
+
+        # Gemini analyzes both the page text and page images.
+        # Four pages are processed in each request.
+        analysis = await asyncio.to_thread(
+            detect_topics_from_pages,
+            pages
+        )
+
+        topics = analysis.get("topics", [])
+
+        if not isinstance(topics, list) or not topics:
+            raise ValueError(
+                "Gemini did not identify any teaching topics "
+                "in the document."
+            )
+
+        now = datetime.now(timezone.utc)
 
         await db.projects.update_one(
             {"_id": ObjectId(project_id)},
-            {"$set": {
-                "status": "analyzed",
-                "page_count": page_count,
-                "summary": analysis.get("summary", ""),
-                "topics": analysis.get("topics", []),
-                "document_title": analysis.get("document_title", ""),
-                "updated_at": datetime.now(timezone.utc),
-            }},
+            {
+                "$set": {
+                    "status": "analyzed",
+                    "page_count": page_count,
+                    "summary": analysis.get("summary", ""),
+                    "topics": topics,
+                    "document_title": analysis.get(
+                        "document_title",
+                        ""
+                    ),
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "last_error": ""
+                },
+            },
         )
 
         updated = await db.projects.find_one(
             {"_id": ObjectId(project_id)}
+        )
+
+        print(
+            f"Visual PDF analysis completed successfully. "
+            f"Topics found: {len(topics)}"
         )
 
         return serialize_project(updated)
@@ -167,12 +324,17 @@ async def analyze_project(project_id: str):
         raise
 
     except Exception as exc:
+        print(f"PDF analysis failed: {exc}")
+
         await db.projects.update_one(
             {"_id": ObjectId(project_id)},
-            {"$set": {
-                "status": "analysis_failed",
-                "last_error": str(exc)
-            }},
+            {
+                "$set": {
+                    "status": "analysis_failed",
+                    "last_error": str(exc),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
         )
 
         raise HTTPException(
@@ -182,20 +344,35 @@ async def analyze_project(project_id: str):
 
 
 @router.post("/{project_id}/topics/{topic_index}/lesson")
-async def generate_lesson_for_topic(project_id: str, topic_index: int):
+async def generate_lesson_for_topic(
+    project_id: str,
+    topic_index: int
+):
     if not ObjectId.is_valid(project_id):
-        raise HTTPException(status_code=400, detail="Invalid project ID.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project ID."
+        )
 
     db = get_database()
-    doc = await db.projects.find_one({"_id": ObjectId(project_id)})
+
+    doc = await db.projects.find_one(
+        {"_id": ObjectId(project_id)}
+    )
 
     if not doc:
-        raise HTTPException(status_code=404, detail="Project not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found."
+        )
 
     topics = doc.get("topics", [])
 
     if topic_index < 0 or topic_index >= len(topics):
-        raise HTTPException(status_code=404, detail="Topic not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Topic not found."
+        )
 
     topic = topics[topic_index]
 
@@ -209,6 +386,8 @@ async def generate_lesson_for_topic(project_id: str, topic_index: int):
         return lesson
 
     except Exception as exc:
+        print(f"Lesson generation failed: {exc}")
+
         raise HTTPException(
             status_code=502,
             detail=f"Lesson generation failed: {exc}"
@@ -222,21 +401,36 @@ async def generate_audio_for_topic(
     request: AudioRequest
 ):
     if not ObjectId.is_valid(project_id):
-        raise HTTPException(status_code=400, detail="Invalid project ID.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project ID."
+        )
 
     db = get_database()
-    doc = await db.projects.find_one({"_id": ObjectId(project_id)})
+
+    doc = await db.projects.find_one(
+        {"_id": ObjectId(project_id)}
+    )
 
     if not doc:
-        raise HTTPException(status_code=404, detail="Project not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found."
+        )
 
     topics = doc.get("topics", [])
 
     if topic_index < 0 or topic_index >= len(topics):
-        raise HTTPException(status_code=404, detail="Topic not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Topic not found."
+        )
 
     if not request.text.strip():
-        raise HTTPException(status_code=400, detail="Audio text cannot be empty.")
+        raise HTTPException(
+            status_code=400,
+            detail="Audio text cannot be empty."
+        )
 
     audio_dir = Path(settings.upload_dir) / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -257,6 +451,10 @@ async def generate_audio_for_topic(
         )
 
     except Exception as exc:
+        audio_path.unlink(missing_ok=True)
+
+        print(f"Audio generation failed: {exc}")
+
         raise HTTPException(
             status_code=502,
             detail=f"Audio generation failed: {exc}"
@@ -270,18 +468,30 @@ async def generate_storyboard_for_topic(
     request: StoryboardRequest
 ):
     if not ObjectId.is_valid(project_id):
-        raise HTTPException(status_code=400, detail="Invalid project ID.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project ID."
+        )
 
     db = get_database()
-    doc = await db.projects.find_one({"_id": ObjectId(project_id)})
+
+    doc = await db.projects.find_one(
+        {"_id": ObjectId(project_id)}
+    )
 
     if not doc:
-        raise HTTPException(status_code=404, detail="Project not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found."
+        )
 
     topics = doc.get("topics", [])
 
     if topic_index < 0 or topic_index >= len(topics):
-        raise HTTPException(status_code=404, detail="Topic not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Topic not found."
+        )
 
     if not request.lesson.get("teacher_script"):
         raise HTTPException(
@@ -309,6 +519,8 @@ async def generate_storyboard_for_topic(
         return storyboard
 
     except Exception as exc:
+        print(f"Storyboard generation failed: {exc}")
+
         raise HTTPException(
             status_code=502,
             detail=f"Storyboard generation failed: {exc}"
@@ -316,29 +528,46 @@ async def generate_storyboard_for_topic(
 
 
 @router.post("/{project_id}/topics/{topic_index}/video")
-async def generate_video_for_topic(project_id: str, topic_index: int):
+async def generate_video_for_topic(
+    project_id: str,
+    topic_index: int
+):
     if not ObjectId.is_valid(project_id):
-        raise HTTPException(status_code=400, detail="Invalid project ID.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project ID."
+        )
 
     db = get_database()
     project_object_id = ObjectId(project_id)
 
-    doc = await db.projects.find_one({"_id": project_object_id})
+    doc = await db.projects.find_one(
+        {"_id": project_object_id}
+    )
 
     if not doc:
-        raise HTTPException(status_code=404, detail="Project not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found."
+        )
 
     topics = doc.get("topics", [])
 
     if topic_index < 0 or topic_index >= len(topics):
-        raise HTTPException(status_code=404, detail="Topic not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Topic not found."
+        )
 
     storyboard = topics[topic_index].get("storyboard")
 
     if not storyboard or not storyboard.get("scenes"):
         raise HTTPException(
             status_code=400,
-            detail="Please generate the storyboard before generating the video."
+            detail=(
+                "Please generate the storyboard before "
+                "generating the video."
+            )
         )
 
     video_dir = Path(settings.upload_dir) / "videos"
@@ -359,7 +588,9 @@ async def generate_video_for_topic(project_id: str, topic_index: int):
             {
                 "$set": {
                     f"topics.{topic_index}.video_path": str(video_path),
-                    f"topics.{topic_index}.video_generated_at": datetime.now(timezone.utc),
+                    f"topics.{topic_index}.video_generated_at": (
+                        datetime.now(timezone.utc)
+                    ),
                     "updated_at": datetime.now(timezone.utc),
                 }
             }
@@ -374,6 +605,8 @@ async def generate_video_for_topic(project_id: str, topic_index: int):
     except Exception as exc:
         video_path.unlink(missing_ok=True)
 
+        print(f"Video generation failed: {exc}")
+
         raise HTTPException(
             status_code=502,
             detail=f"Video generation failed: {exc}"
@@ -381,25 +614,43 @@ async def generate_video_for_topic(project_id: str, topic_index: int):
 
 
 @router.get("/{project_id}/topics/{topic_index}/video")
-async def download_topic_video(project_id: str, topic_index: int):
+async def download_topic_video(
+    project_id: str,
+    topic_index: int
+):
     if not ObjectId.is_valid(project_id):
-        raise HTTPException(status_code=400, detail="Invalid project ID.")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid project ID."
+        )
 
     db = get_database()
-    doc = await db.projects.find_one({"_id": ObjectId(project_id)})
+
+    doc = await db.projects.find_one(
+        {"_id": ObjectId(project_id)}
+    )
 
     if not doc:
-        raise HTTPException(status_code=404, detail="Project not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Project not found."
+        )
 
     topics = doc.get("topics", [])
 
     if topic_index < 0 or topic_index >= len(topics):
-        raise HTTPException(status_code=404, detail="Topic not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Topic not found."
+        )
 
     video_path = topics[topic_index].get("video_path")
 
     if not video_path or not Path(video_path).is_file():
-        raise HTTPException(status_code=404, detail="Video has not been generated yet.")
+        raise HTTPException(
+            status_code=404,
+            detail="Video has not been generated yet."
+        )
 
     return FileResponse(
         path=video_path,
